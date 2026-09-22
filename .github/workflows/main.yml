@@ -56,7 +56,13 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld llvm uuid-dev liblzma-dev zip unzip curl ca-certificates
+            clang lld llvm uuid-dev liblzma-dev zip unzip curl ca-certificates xz-utils
+
+      - name: Set up Go for payload extraction
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
 
       - name: Build Linux toolkit
         shell: bash
@@ -78,41 +84,62 @@ jobs:
           echo "Downloaded: $(du -h work/rom.zip | cut -f1)"
 
       - name: Extract abl.img
-        shell: python
+        shell: bash
         run: |
+          set -euo pipefail
+          output="$TOOLKIT/images/abl.img"
+          mkdir -p "$(dirname "$output")"
+
+          # Old-style recovery ZIPs may contain abl.img as a normal ZIP entry.
+          # A/B OTA ZIPs instead store the partition inside payload.bin.
+          python3 <<'PY'
           import os
           import sys
           import zipfile
 
           rom = "work/rom.zip"
           output = os.path.join(os.environ["TOOLKIT"], "images", "abl.img")
-
           with zipfile.ZipFile(rom) as archive:
+              files = [i for i in archive.infolist() if not i.is_dir()]
               candidates = [
-                  info for info in archive.infolist()
-                  if not info.is_dir()
-                  and info.filename.replace("\\", "/").lower().split("/")[-1] == "abl.img"
+                  i for i in files
+                  if i.filename.replace("\\", "/").lower().split("/")[-1] == "abl.img"
               ]
-              if not candidates:
-                  sys.exit(
-                      "No abl.img found in this recovery ZIP. "
-                      "Use a full HyperOS recovery ROM, not an incremental OTA or fastboot ROM."
+              if candidates:
+                  preferred = [
+                      i for i in candidates
+                      if i.filename.replace("\\", "/").lower().endswith("firmware-update/abl.img")
+                  ]
+                  selected = preferred[0] if preferred else candidates[0]
+                  with archive.open(selected) as source, open(output, "wb") as target:
+                      while chunk := source.read(1024 * 1024):
+                          target.write(chunk)
+                  print(f"Extracted direct ZIP entry: {selected.filename}")
+              else:
+                  has_payload = any(
+                      i.filename.replace("\\", "/").lower().split("/")[-1] == "payload.bin"
+                      for i in files
                   )
+                  if not has_payload:
+                      sys.exit("ROM ZIP contains neither abl.img nor payload.bin")
+                  print("abl.img is inside payload.bin; using payload-dumper-go")
+          PY
 
-              preferred = [
-                  info for info in candidates
-                  if info.filename.replace("\\", "/").lower().endswith("firmware-update/abl.img")
-              ]
-              selected = preferred[0] if preferred else candidates[0]
-              if selected.file_size < 100_000 or selected.file_size > 100_000_000:
-                  sys.exit(f"Suspicious abl.img size: {selected.file_size} bytes")
+          if [[ ! -s "$output" ]]; then
+            go install github.com/ssut/payload-dumper-go@v2.0.2
+            mkdir -p work/payload-output
+            "$(go env GOPATH)/bin/payload-dumper-go" \
+              -p abl -o work/payload-output work/rom.zip
+            test -s work/payload-output/abl.img
+            mv work/payload-output/abl.img "$output"
+          fi
 
-              os.makedirs(os.path.dirname(output), exist_ok=True)
-              with archive.open(selected) as source, open(output, "wb") as target:
-                  while chunk := source.read(1024 * 1024):
-                      target.write(chunk)
-
-          print(f"Extracted {selected.filename} ({selected.file_size:,} bytes) -> {output}")
+          size=$(stat -c '%s' "$output")
+          if (( size < 100000 || size > 100000000 )); then
+            echo "::error::Suspicious abl.img size: $size bytes"
+            exit 1
+          fi
+          echo "Ready: $output ($size bytes)"
 
       - name: Create fake-unlock files
         shell: bash
@@ -170,4 +197,4 @@ jobs:
       - name: Remove downloaded ROM from runner
         if: always()
         shell: bash
-        run: rm -f work/rom.zip
+        run: rm -rf work/rom.zip work/payload-output
