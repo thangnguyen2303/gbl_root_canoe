@@ -126,7 +126,10 @@ jobs:
           PY
 
           if [[ ! -s "$output" ]]; then
+            # Upstream's release tag is "2.0.2" (without the Go-required "v").
+            # Pin the verified release commit instead of using the invalid @v2.0.2.
             go install github.com/ssut/payload-dumper-go@v2.0.2
+            go install github.com/ssut/payload-dumper-go@05fe59e
             mkdir -p work/payload-output
             "$(go env GOPATH)/bin/payload-dumper-go" \
               -p abl -o work/payload-output work/rom.zip
